@@ -1,0 +1,167 @@
+name: iOS sürüm paketi
+
+# Bu dosya iki yerde çalışır: cokokey deposunda ya da kendi Actions kotası olan ayrı bir derleme deposunda
+# (o depoya aynen kopyalanır, oyunu COKOKEY_OKUMA salt okunur anahtarıyla egunsayar/cokokey'den çeker).
+# Elle çalışır. Oyunu macOS makinesinde derler, App Store Connect API anahtarıyla imzalar ve TestFlight'a yükler.
+# Mac gerekmez. Özel depoda macOS dakikası on kat sayılır, o yüzden iş yalnızca elle başlar.
+# Gerekli sırlar: APPLE_TEAM_ID, ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8 (.p8 dosyasının içeriği, düz ya da base64).
+# İsteğe bağlı: ADMOB_IOS_APP_ID, ADMOB_IOS_ODUL_ID (yoksa Google test reklamı), GOOGLE_SERVICE_INFO_PLIST,
+# VITE_SENTRY_DSN, VITE_POSTHOG_KEY, VITE_POSTHOG_HOST.
+on:
+  workflow_dispatch:
+    inputs:
+      dal:
+        description: 'Derlenecek cokokey dalı'
+        required: false
+        default: main
+        type: string
+      uretim:
+        description: 'Mağazaya çıkacak sürüm. İşaretlersen gerçek reklam kimlikleri zorunlu olur.'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-surum
+  cancel-in-progress: false
+
+jobs:
+  testflight:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: egunsayar/cokokey
+          ref: ${{ inputs.dal || 'main' }}
+          token: ${{ secrets.COKOKEY_OKUMA || github.token }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Gizli değişkenleri denetle
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          ADMOB_IOS_APP_ID: ${{ secrets.ADMOB_IOS_APP_ID }}
+          ADMOB_IOS_ODUL_ID: ${{ secrets.ADMOB_IOS_ODUL_ID }}
+          URETIM: ${{ inputs.uretim }}
+        run: |
+          eksik=0
+          for ad in APPLE_TEAM_ID ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8; do
+            if [ -z "${!ad}" ]; then echo "::error::$ad sırrı yok. GitHub > Settings > Secrets and variables > Actions altına ekle."; eksik=1; fi
+          done
+          if [ "$URETIM" = "true" ]; then
+            for ad in ADMOB_IOS_APP_ID ADMOB_IOS_ODUL_ID; do
+              if [ -z "${!ad}" ]; then echo "::error::Mağaza sürümü için $ad sırrı gerekir."; eksik=1; fi
+            done
+          elif [ -z "$ADMOB_IOS_APP_ID" ] || [ -z "$ADMOB_IOS_ODUL_ID" ]; then
+            echo "::warning::AdMob iOS kimlikleri yok. Bu derleme Google test reklamı gösterir."
+          fi
+          exit $eksik
+
+      - run: npm ci --ignore-scripts
+
+      - name: Firebase ayar dosyasını sırdan yaz
+        env:
+          GOOGLE_SERVICE_INFO_PLIST: ${{ secrets.GOOGLE_SERVICE_INFO_PLIST }}
+        run: node scripts/googleServiceInfoYaz.mjs ios/App/App/GoogleService-Info.plist
+
+      - name: Oyunu derle ve iOS projesine kopyala
+        env:
+          VITE_SENTRY_DSN: ${{ secrets.VITE_SENTRY_DSN }}
+          VITE_POSTHOG_KEY: ${{ secrets.VITE_POSTHOG_KEY }}
+          VITE_POSTHOG_HOST: ${{ secrets.VITE_POSTHOG_HOST }}
+          VITE_ADMOB_APP: ${{ secrets.ADMOB_IOS_APP_ID }}
+          VITE_ADMOB_ODUL: ${{ secrets.ADMOB_IOS_ODUL_ID }}
+        run: npm run build && npx cap sync ios
+
+      - name: API anahtarını geçici dosyaya aç
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          ANAHTAR="$RUNNER_TEMP/AuthKey_$(printf '%s' "$ASC_KEY_ID" | tr -d '[:space:]').p8"
+          if printf '%s' "$ASC_KEY_P8" | grep -q 'BEGIN PRIVATE KEY'; then
+            printf '%s\n' "$ASC_KEY_P8" > "$ANAHTAR"
+          elif ! printf '%s' "$ASC_KEY_P8" | tr -d '[:space:]' | base64 --decode > "$ANAHTAR" 2>/dev/null || ! grep -q 'BEGIN PRIVATE KEY' "$ANAHTAR"; then
+            echo "::error::ASC_KEY_P8 okunamadı. App Store Connect'ten indirilen .p8 dosyasının bütün içeriğini yapıştır."
+            exit 1
+          fi
+          echo "ANAHTAR=$ANAHTAR" >> "$GITHUB_ENV"
+
+      - name: Arşivle ve imzala
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ADMOB_IOS_APP_ID: ${{ secrets.ADMOB_IOS_APP_ID }}
+        run: |
+          set -euo pipefail
+          SURUM=$(node -p "require('./package.json').version")
+          ADMOB=${ADMOB_IOS_APP_ID:-ca-app-pub-3940256099942544~1458002511}
+          xcodebuild archive \
+            -project ios/App/App.xcodeproj -scheme App -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ANAHTAR" \
+            -authenticationKeyID "$(printf '%s' "$ASC_KEY_ID" | tr -d '[:space:]')" \
+            -authenticationKeyIssuerID "$(printf '%s' "$ASC_ISSUER_ID" | tr -d '[:space:]')" \
+            -skipPackagePluginValidation -skipMacroValidation \
+            DEVELOPMENT_TEAM="$(printf '%s' "$APPLE_TEAM_ID" | tr -d '[:space:]')" \
+            CODE_SIGN_STYLE=Automatic \
+            MARKETING_VERSION="$SURUM" \
+            CURRENT_PROJECT_VERSION="${{ github.run_number }}" \
+            ADMOB_APP_ID="$ADMOB" \
+            | tail -n 80
+
+      - name: TestFlight'a yükle
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>teamID</key><string>$(printf '%s' "$APPLE_TEAM_ID" | tr -d '[:space:]')</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>uploadSymbols</key><true/>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+          </dict>
+          </plist>
+          PLIST
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/cikti" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ANAHTAR" \
+            -authenticationKeyID "$(printf '%s' "$ASC_KEY_ID" | tr -d '[:space:]')" \
+            -authenticationKeyIssuerID "$(printf '%s' "$ASC_ISSUER_ID" | tr -d '[:space:]')"
+          echo "### TestFlight'a yüklendi" >> "$GITHUB_STEP_SUMMARY"
+          echo "Derleme ${{ github.run_number }}. Apple işlemeyi 10–30 dakikada bitirir, sonra TestFlight uygulamasında görünür." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Anahtarı sil
+        if: always()
+        run: rm -f "$RUNNER_TEMP"/AuthKey_*.p8

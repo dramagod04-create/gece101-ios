@@ -130,7 +130,15 @@ jobs:
             MARKETING_VERSION="$SURUM" \
             CURRENT_PROJECT_VERSION="${{ github.run_number }}" \
             ADMOB_APP_ID="$ADMOB" \
-            | tail -n 80
+            > "$RUNNER_TEMP/arsiv.log" 2>&1 || {
+              echo "::group::Kaydın son 60 satırı"; tail -n 60 "$RUNNER_TEMP/arsiv.log"; echo "::endgroup::"
+              echo "### Derleme hataları" >> "$GITHUB_STEP_SUMMARY"
+              grep -E "(error|fatal error):" "$RUNNER_TEMP/arsiv.log" | sort -u | head -n 30 | while IFS= read -r satir; do
+                echo "::error::$satir"; echo "- \`$satir\`" >> "$GITHUB_STEP_SUMMARY"
+              done
+              exit 1
+            }
+            tail -n 20 "$RUNNER_TEMP/arsiv.log"
 
       - name: Mağaza imzasıyla imzala ve TestFlight'a yükle
         env:

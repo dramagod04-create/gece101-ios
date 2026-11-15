@@ -77,7 +77,10 @@ jobs:
       - name: Firebase ayar dosyasını sırdan yaz
         env:
           GOOGLE_SERVICE_INFO_PLIST: ${{ secrets.GOOGLE_SERVICE_INFO_PLIST }}
-        run: node scripts/googleServiceInfoYaz.mjs ios/App/App/GoogleService-Info.plist
+        run: |
+          node scripts/googleServiceInfoYaz.mjs ios/App/App/GoogleService-Info.plist
+          # Dosya yoksa oyun uzak ayarı hiç çağırmaz (iOS'ta Firebase'siz çağrı uygulamayı çökertir)
+          if [ -f ios/App/App/GoogleService-Info.plist ]; then echo "VITE_FIREBASE_IOS=1" >> "$GITHUB_ENV"; fi
 
       - name: Oyunu derle ve iOS projesine kopyala
         env:

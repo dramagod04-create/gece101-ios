@@ -104,7 +104,9 @@ jobs:
           fi
           echo "ANAHTAR=$ANAHTAR" >> "$GITHUB_ENV"
 
-      - name: Arşivle ve imzala
+      # Arşiv imzasız alınır. Otomatik imza arşivde geliştirme profili ister, o da kayıtlı cihaz ister.
+      # Mağaza (App Store Connect) imzasını bir sonraki adımda dışa aktarma, API anahtarıyla bulutta yapar.
+      - name: Arşivle
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
@@ -124,13 +126,13 @@ jobs:
             -authenticationKeyIssuerID "$(printf '%s' "$ASC_ISSUER_ID" | tr -d '[:space:]')" \
             -skipPackagePluginValidation -skipMacroValidation \
             DEVELOPMENT_TEAM="$(printf '%s' "$APPLE_TEAM_ID" | tr -d '[:space:]')" \
-            CODE_SIGN_STYLE=Automatic \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
             MARKETING_VERSION="$SURUM" \
             CURRENT_PROJECT_VERSION="${{ github.run_number }}" \
             ADMOB_APP_ID="$ADMOB" \
             | tail -n 80
 
-      - name: TestFlight'a yükle
+      - name: Mağaza imzasıyla imzala ve TestFlight'a yükle
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}

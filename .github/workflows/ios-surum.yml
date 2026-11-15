@@ -104,8 +104,9 @@ jobs:
           fi
           echo "ANAHTAR=$ANAHTAR" >> "$GITHUB_ENV"
 
-      # Arşiv imzasız alınır. Otomatik imza arşivde geliştirme profili ister, o da kayıtlı cihaz ister.
-      # Mağaza (App Store Connect) imzasını bir sonraki adımda dışa aktarma, API anahtarıyla bulutta yapar.
+      # Arşiv otomatik imzayla (geliştirme profili) alınır. Bunun için hesapta en az bir kayıtlı iPhone gerekir
+      # (developer.apple.com → Devices). İmzasız arşivde hazır gelen reklam/Sentry kütüphanelerinin imzası bozuluyor.
+      # Mağaza imzasını bir sonraki adımda dışa aktarma, API anahtarıyla bulutta yapar.
       - name: Arşivle
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -126,7 +127,7 @@ jobs:
             -authenticationKeyIssuerID "$(printf '%s' "$ASC_ISSUER_ID" | tr -d '[:space:]')" \
             -skipPackagePluginValidation -skipMacroValidation \
             DEVELOPMENT_TEAM="$(printf '%s' "$APPLE_TEAM_ID" | tr -d '[:space:]')" \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_STYLE=Automatic \
             MARKETING_VERSION="$SURUM" \
             CURRENT_PROJECT_VERSION="${{ github.run_number }}" \
             ADMOB_APP_ID="$ADMOB" \

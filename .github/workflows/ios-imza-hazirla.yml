@@ -1,0 +1,201 @@
+name: iOS imza sertifikası hazırla
+
+# Bir kez elle çalışır (sertifika bitince ya da kaybolunca yeniden). Mac ve terminal gerekmez.
+# App Store Connect API anahtarıyla Apple'da tek bir Apple Distribution sertifikası ve bir App Store profili açar,
+# sertifikayı IOS_DIST_P12_PASSWORD parolasıyla .p12 yapar ve ikisini base64 metin olarak bir günlük indirilebilir
+# pakete koyar. Paketteki iki metin IOS_DIST_P12 ve IOS_PROFILE sırlarına yapıştırılır, sonra paket silinir.
+# Ucuz Linux makinesinde çalışır, macOS dakikası harcamaz. cokokey deposunda ya da ayrı derleme deposunda aynen çalışır.
+# Gerekli sırlar: ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8 (Admin yetkili anahtar), IOS_DIST_P12_PASSWORD (kendin uydur, uzun olsun).
+on:
+  workflow_dispatch:
+    inputs:
+      profil_adi:
+        description: 'Apple Developer sitesinde görünecek profil adı (aynı adlı eski profil silinip yenisi açılır)'
+        required: false
+        default: '101 Gece App Store GitHub'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-imza-hazirla
+  cancel-in-progress: false
+
+jobs:
+  hazirla:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Gizli değişkenleri denetle
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          IOS_DIST_P12_PASSWORD: ${{ secrets.IOS_DIST_P12_PASSWORD }}
+        run: |
+          eksik=0
+          for ad in ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8 IOS_DIST_P12_PASSWORD; do
+            if [ -z "${!ad}" ]; then echo "::error::$ad sırrı yok. GitHub > Settings > Secrets and variables > Actions altına ekle."; eksik=1; fi
+          done
+          if [ -n "$IOS_DIST_P12_PASSWORD" ] && [ ${#IOS_DIST_P12_PASSWORD} -lt 12 ]; then
+            echo "::error::IOS_DIST_P12_PASSWORD en az 12 karakter olmalı."; eksik=1
+          fi
+          exit $eksik
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: API anahtarını geçici dosyaya aç
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          ANAHTAR="$RUNNER_TEMP/asc.p8"
+          if printf '%s' "$ASC_KEY_P8" | grep -q 'BEGIN PRIVATE KEY'; then
+            printf '%s\n' "$ASC_KEY_P8" > "$ANAHTAR"
+          elif ! printf '%s' "$ASC_KEY_P8" | tr -d '[:space:]' | base64 --decode > "$ANAHTAR" 2>/dev/null || ! grep -q 'BEGIN PRIVATE KEY' "$ANAHTAR"; then
+            echo "::error::ASC_KEY_P8 okunamadı. App Store Connect'ten indirilen .p8 dosyasının bütün içeriğini yapıştır."
+            exit 1
+          fi
+          echo "ANAHTAR=$ANAHTAR" >> "$GITHUB_ENV"
+
+      - name: Özel anahtar ve sertifika isteği üret
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/imza"
+          openssl req -new -newkey rsa:2048 -nodes \
+            -keyout "$RUNNER_TEMP/imza/anahtar.pem" \
+            -subj "/CN=101 Gece GitHub/C=TR" \
+            -out "$RUNNER_TEMP/imza/istek.csr" 2>/dev/null
+
+      - name: Apple'da sertifika ve App Store profili aç
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          PROFIL_ADI: ${{ inputs.profil_adi }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/apple.mjs" <<'JS'
+          import crypto from 'node:crypto';
+          import fs from 'node:fs';
+
+          const PAKET = 'com.enesgunsayar.gece101';
+          const klasor = process.env.RUNNER_TEMP + '/imza';
+          const kid = process.env.ASC_KEY_ID.replace(/\s/g, '');
+          const iss = process.env.ASC_ISSUER_ID.replace(/\s/g, '');
+          const profilAdi = (process.env.PROFIL_ADI || '101 Gece App Store GitHub').trim();
+          const anahtar = fs.readFileSync(process.env.ANAHTAR, 'utf8');
+
+          const b64u = (v) => Buffer.from(typeof v === 'string' ? v : JSON.stringify(v)).toString('base64url');
+          function jeton() {
+            const simdi = Math.floor(Date.now() / 1000);
+            const govde = b64u({ alg: 'ES256', kid, typ: 'JWT' }) + '.' + b64u({ iss, iat: simdi, exp: simdi + 600, aud: 'appstoreconnect-v1' });
+            const imza = crypto.sign('sha256', Buffer.from(govde), { key: anahtar, dsaEncoding: 'ieee-p1363' });
+            return govde + '.' + imza.toString('base64url');
+          }
+          async function api(yontem, yol, govde) {
+            const yanit = await fetch('https://api.appstoreconnect.apple.com' + yol, {
+              method: yontem,
+              headers: { Authorization: 'Bearer ' + jeton(), 'Content-Type': 'application/json' },
+              body: govde ? JSON.stringify(govde) : undefined,
+            });
+            const metin = await yanit.text();
+            const veri = metin ? JSON.parse(metin) : {};
+            if (!yanit.ok) {
+              const ayrinti = (veri.errors || []).map((e) => `${e.title}: ${e.detail}`).join(' | ') || metin;
+              const hata = new Error(`${yontem} ${yol} → ${yanit.status} ${ayrinti}`);
+              hata.durum = yanit.status;
+              throw hata;
+            }
+            return veri;
+          }
+
+          // 1) Apple Distribution sertifikası
+          let sertifika;
+          try {
+            sertifika = await api('POST', '/v1/certificates', {
+              data: { type: 'certificates', attributes: { certificateType: 'DISTRIBUTION', csrContent: fs.readFileSync(klasor + '/istek.csr', 'utf8') } },
+            });
+          } catch (e) {
+            console.log(`::error::Sertifika açılamadı. ${e.message}`);
+            if (e.durum === 409 || /maximum|already have/i.test(e.message)) {
+              console.log('::error::Hesapta dağıtım sertifikası sınırı dolu. developer.apple.com → Certificates sayfasında eski Distribution sertifikalarını iptal edip (Revoke) bu işi yeniden çalıştır.');
+            }
+            if (e.durum === 401 || e.durum === 403) {
+              console.log('::error::API anahtarının yetkisi yetmiyor. Anahtarın erişimi Admin olmalı.');
+            }
+            process.exit(1);
+          }
+          const sertifikaId = sertifika.data.id;
+          fs.writeFileSync(klasor + '/sertifika.der', Buffer.from(sertifika.data.attributes.certificateContent, 'base64'));
+          console.log(`Sertifika açıldı: ${sertifika.data.attributes.name || 'Apple Distribution'}, son geçerlilik ${sertifika.data.attributes.expirationDate}`);
+
+          // 2) Uygulama kimliği
+          const kimlikler = await api('GET', `/v1/bundleIds?filter[identifier]=${encodeURIComponent(PAKET)}&limit=200`);
+          const kimlik = (kimlikler.data || []).find((b) => b.attributes.identifier === PAKET && b.attributes.platform !== 'MAC_OS');
+          if (!kimlik) {
+            console.log(`::error::${PAKET} uygulama kimliği bulunamadı. developer.apple.com → Identifiers altında aç.`);
+            process.exit(1);
+          }
+
+          // 3) Aynı adlı eski profili sil, yenisini aç
+          const eskiler = await api('GET', `/v1/profiles?filter[name]=${encodeURIComponent(profilAdi)}&limit=200`);
+          for (const p of eskiler.data || []) {
+            if (p.attributes.name === profilAdi) {
+              await api('DELETE', `/v1/profiles/${p.id}`);
+              console.log(`Aynı adlı eski profil silindi (${p.id}).`);
+            }
+          }
+          const profil = await api('POST', '/v1/profiles', {
+            data: {
+              type: 'profiles',
+              attributes: { name: profilAdi, profileType: 'IOS_APP_STORE' },
+              relationships: {
+                bundleId: { data: { type: 'bundleIds', id: kimlik.id } },
+                certificates: { data: [{ type: 'certificates', id: sertifikaId }] },
+              },
+            },
+          });
+          fs.writeFileSync(klasor + '/profil.mobileprovision', Buffer.from(profil.data.attributes.profileContent, 'base64'));
+          console.log(`Profil açıldı: ${profilAdi}, son geçerlilik ${profil.data.attributes.expirationDate}`);
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY,
+            `### Hazır\nSertifika son geçerlilik ${sertifika.data.attributes.expirationDate}. Profil \`${profilAdi}\`.\n`);
+          JS
+          node "$RUNNER_TEMP/apple.mjs"
+
+      - name: .p12 yap ve base64 metinlerini hazırla
+        env:
+          IOS_DIST_P12_PASSWORD: ${{ secrets.IOS_DIST_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          cd "$RUNNER_TEMP/imza"
+          openssl x509 -inform der -in sertifika.der -out sertifika.pem
+          # macOS'un security aracı OpenSSL 3'ün varsayılan .p12 şifrelemesini okuyamayabiliyor; bilinen eski biçim kullanılır.
+          openssl pkcs12 -export -inkey anahtar.pem -in sertifika.pem -name "101 Gece Apple Distribution" \
+            -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1 \
+            -passout env:IOS_DIST_P12_PASSWORD -out dagitim.p12
+          mkdir -p "$RUNNER_TEMP/paket"
+          base64 -w0 dagitim.p12 > "$RUNNER_TEMP/paket/IOS_DIST_P12.txt"
+          base64 -w0 profil.mobileprovision > "$RUNNER_TEMP/paket/IOS_PROFILE.txt"
+          cat > "$RUNNER_TEMP/paket/OKU.txt" <<'METIN'
+          IOS_DIST_P12.txt dosyasının içeriğini IOS_DIST_P12 sırrına,
+          IOS_PROFILE.txt dosyasının içeriğini IOS_PROFILE sırrına yapıştır.
+          Sonra bu paketi bilgisayarından ve Actions sayfasından sil.
+          METIN
+          rm -f anahtar.pem
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-imza-sirlari
+          path: ${{ runner.temp }}/paket/
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Geçici dosyaları sil
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/imza" "$RUNNER_TEMP/paket" "$RUNNER_TEMP/asc.p8"

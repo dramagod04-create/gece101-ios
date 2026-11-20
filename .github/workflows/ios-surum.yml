@@ -2,9 +2,12 @@ name: iOS sürüm paketi
 
 # Bu dosya iki yerde çalışır: cokokey deposunda ya da kendi Actions kotası olan ayrı bir derleme deposunda
 # (o depoya aynen kopyalanır, oyunu COKOKEY_OKUMA salt okunur anahtarıyla egunsayar/cokokey'den çeker).
-# Elle çalışır. Oyunu macOS makinesinde derler, App Store Connect API anahtarıyla imzalar ve TestFlight'a yükler.
+# Elle çalışır. Oyunu macOS makinesinde derler, sabit bir Apple Distribution sertifikası ve App Store profiliyle
+# elle imzalar (her çalışmada yeni sertifika üretmez) ve App Store Connect API anahtarıyla TestFlight'a yükler.
 # Mac gerekmez. Özel depoda macOS dakikası on kat sayılır, o yüzden iş yalnızca elle başlar.
-# Gerekli sırlar: APPLE_TEAM_ID, ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8 (.p8 dosyasının içeriği, düz ya da base64).
+# Gerekli sırlar: APPLE_TEAM_ID, ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8 (.p8 dosyasının içeriği, düz ya da base64),
+# IOS_DIST_P12 (Apple Distribution sertifikası .p12, base64), IOS_DIST_P12_PASSWORD (.p12 parolası),
+# IOS_PROFILE (App Store provisioning profili .mobileprovision, base64). Üçünü ios-imza-hazirla.yml işi bir kez üretir.
 # İsteğe bağlı: ADMOB_IOS_APP_ID, ADMOB_IOS_ODUL_ID (yoksa Google test reklamı), GOOGLE_SERVICE_INFO_PLIST,
 # VITE_SENTRY_DSN, VITE_POSTHOG_KEY, VITE_POSTHOG_HOST.
 on:
@@ -55,14 +58,20 @@ jobs:
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
           ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          IOS_DIST_P12: ${{ secrets.IOS_DIST_P12 }}
+          IOS_DIST_P12_PASSWORD: ${{ secrets.IOS_DIST_P12_PASSWORD }}
+          IOS_PROFILE: ${{ secrets.IOS_PROFILE }}
           ADMOB_IOS_APP_ID: ${{ secrets.ADMOB_IOS_APP_ID }}
           ADMOB_IOS_ODUL_ID: ${{ secrets.ADMOB_IOS_ODUL_ID }}
           URETIM: ${{ inputs.uretim }}
         run: |
           eksik=0
-          for ad in APPLE_TEAM_ID ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8; do
+          for ad in APPLE_TEAM_ID ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8 IOS_DIST_P12 IOS_DIST_P12_PASSWORD IOS_PROFILE; do
             if [ -z "${!ad}" ]; then echo "::error::$ad sırrı yok. GitHub > Settings > Secrets and variables > Actions altına ekle."; eksik=1; fi
           done
+          if [ -z "$IOS_DIST_P12" ] || [ -z "$IOS_PROFILE" ]; then
+            echo "::error::İmza sırlarını üretmek için önce 'iOS imza sertifikası hazırla' işini çalıştır (docs/magaza/ios-kurulum.md)."
+          fi
           if [ "$URETIM" = "true" ]; then
             for ad in ADMOB_IOS_APP_ID ADMOB_IOS_ODUL_ID; do
               if [ -z "${!ad}" ]; then echo "::error::Mağaza sürümü için $ad sırrı gerekir."; eksik=1; fi
@@ -107,14 +116,83 @@ jobs:
           fi
           echo "ANAHTAR=$ANAHTAR" >> "$GITHUB_ENV"
 
-      # Arşiv otomatik imzayla (geliştirme profili) alınır. Bunun için hesapta en az bir kayıtlı iPhone gerekir
-      # (developer.apple.com → Devices). İmzasız arşivde hazır gelen reklam/Sentry kütüphanelerinin imzası bozuluyor.
-      # Mağaza imzasını bir sonraki adımda dışa aktarma, API anahtarıyla bulutta yapar.
+      # Sabit imza: sırlardaki tek Apple Distribution sertifikası geçici bir anahtar zincirine, App Store profili
+      # Xcode'un profil klasörüne konur. Böylece derleme Apple'da yeni sertifika ya da profil üretmez
+      # (otomatik imza her çalışmada yeni sertifika açıp hesabın sertifika sınırını dolduruyordu).
+      - name: İmza sertifikasını ve profili kur
+        env:
+          IOS_DIST_P12: ${{ secrets.IOS_DIST_P12 }}
+          IOS_DIST_P12_PASSWORD: ${{ secrets.IOS_DIST_P12_PASSWORD }}
+          IOS_PROFILE: ${{ secrets.IOS_PROFILE }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          umask 077
+          PAKET=com.enesgunsayar.gece101
+          ZINCIR="$RUNNER_TEMP/imza.keychain-db"
+          ZINCIR_PAROLA=$(openssl rand -hex 24)
+          if ! printf '%s' "$IOS_DIST_P12" | tr -d '[:space:]' | base64 --decode > "$RUNNER_TEMP/dagitim.p12" 2>/dev/null || [ ! -s "$RUNNER_TEMP/dagitim.p12" ]; then
+            echo "::error::IOS_DIST_P12 base64 olarak açılamadı. .p12 dosyasının base64 hâlini yapıştır."; exit 1
+          fi
+          if ! printf '%s' "$IOS_PROFILE" | tr -d '[:space:]' | base64 --decode > "$RUNNER_TEMP/profil.mobileprovision" 2>/dev/null || [ ! -s "$RUNNER_TEMP/profil.mobileprovision" ]; then
+            echo "::error::IOS_PROFILE base64 olarak açılamadı. .mobileprovision dosyasının base64 hâlini yapıştır."; exit 1
+          fi
+
+          security create-keychain -p "$ZINCIR_PAROLA" "$ZINCIR"
+          security set-keychain-settings -lut 21600 "$ZINCIR"
+          security unlock-keychain -p "$ZINCIR_PAROLA" "$ZINCIR"
+          if ! security import "$RUNNER_TEMP/dagitim.p12" -P "$IOS_DIST_P12_PASSWORD" -f pkcs12 -A -k "$ZINCIR" >/dev/null; then
+            echo "::error::.p12 içe aktarılamadı. IOS_DIST_P12_PASSWORD yanlış olabilir."; exit 1
+          fi
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$ZINCIR_PAROLA" "$ZINCIR" >/dev/null
+          security list-keychains -d user -s "$ZINCIR" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/dagitim.p12"
+
+          KIMLIK=$(security find-identity -v -p codesigning "$ZINCIR" | grep -E '"(Apple|iPhone) Distribution' | head -n 1 | awk '{print $2}')
+          if [ -z "$KIMLIK" ]; then
+            echo "::error::.p12 içinde Apple Distribution sertifikası ve özel anahtarı yok. Geliştirme sertifikası değil, dağıtım sertifikası gerekir."
+            security find-identity -v -p codesigning "$ZINCIR" || true
+            exit 1
+          fi
+
+          security cms -D -i "$RUNNER_TEMP/profil.mobileprovision" > "$RUNNER_TEMP/profil.plist"
+          PB=/usr/libexec/PlistBuddy
+          PROFIL_UUID=$($PB -c 'Print UUID' "$RUNNER_TEMP/profil.plist")
+          PROFIL_AD=$($PB -c 'Print Name' "$RUNNER_TEMP/profil.plist")
+          TAKIM=$($PB -c 'Print TeamIdentifier:0' "$RUNNER_TEMP/profil.plist")
+          UYGULAMA=$($PB -c 'Print Entitlements:application-identifier' "$RUNNER_TEMP/profil.plist")
+          BITIS=$($PB -c 'Print ExpirationDate' "$RUNNER_TEMP/profil.plist")
+          if [ "$UYGULAMA" != "$TAKIM.$PAKET" ]; then
+            echo "::error::Profil $UYGULAMA için yapılmış, $TAKIM.$PAKET olmalı."; exit 1
+          fi
+          if $PB -c 'Print ProvisionedDevices' "$RUNNER_TEMP/profil.plist" >/dev/null 2>&1; then
+            echo "::error::Bu profil App Store profili değil (içinde cihaz listesi var). Distribution → App Store Connect türünde profil gerekir."; exit 1
+          fi
+          TEAM_SIR=$(printf '%s' "$APPLE_TEAM_ID" | tr -d '[:space:]')
+          if [ -n "$TEAM_SIR" ] && [ "$TEAM_SIR" != "$TAKIM" ]; then
+            echo "::warning::APPLE_TEAM_ID ($TEAM_SIR) profilin takımıyla ($TAKIM) aynı değil. Profilin takımı kullanılıyor."
+          fi
+          for klasor in "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
+            mkdir -p "$klasor"
+            cp "$RUNNER_TEMP/profil.mobileprovision" "$klasor/$PROFIL_UUID.mobileprovision"
+          done
+          rm -f "$RUNNER_TEMP/profil.mobileprovision" "$RUNNER_TEMP/profil.plist"
+
+          # Elle imza ayarı yalnız uygulama hedefinin Release ayarına yazılır. Komut satırından verilen profil
+          # Swift paketlerine de geçip "does not support provisioning profiles" hatası verirdi.
+          export KIMLIK PROFIL_AD TAKIM
+          perl -0pi -e 's{(504EC3181FED79650016851F /\* Release \*/ = \{[^\}]*?)CODE_SIGN_STYLE = Automatic;}{$1CODE_SIGN_STYLE = Manual;\n\t\t\t\tCODE_SIGN_IDENTITY = "$ENV{KIMLIK}";\n\t\t\t\tPROVISIONING_PROFILE_SPECIFIER = "$ENV{PROFIL_AD}";\n\t\t\t\tDEVELOPMENT_TEAM = $ENV{TAKIM};}s or die "App hedefinin Release imza ayarı bulunamadı\n"' ios/App/App.xcodeproj/project.pbxproj
+
+          {
+            echo "IMZA_KIMLIK=$KIMLIK"
+            echo "PROFIL_AD=$PROFIL_AD"
+            echo "TAKIM=$TAKIM"
+          } >> "$GITHUB_ENV"
+          echo "### İmza" >> "$GITHUB_STEP_SUMMARY"
+          echo "Profil \`$PROFIL_AD\` ($PROFIL_UUID), son geçerlilik $BITIS." >> "$GITHUB_STEP_SUMMARY"
+
       - name: Arşivle
         env:
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
-          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
           ADMOB_IOS_APP_ID: ${{ secrets.ADMOB_IOS_APP_ID }}
         run: |
           set -euo pipefail
@@ -124,13 +202,8 @@ jobs:
             -project ios/App/App.xcodeproj -scheme App -configuration Release \
             -destination 'generic/platform=iOS' \
             -archivePath "$RUNNER_TEMP/App.xcarchive" \
-            -allowProvisioningUpdates \
-            -authenticationKeyPath "$ANAHTAR" \
-            -authenticationKeyID "$(printf '%s' "$ASC_KEY_ID" | tr -d '[:space:]')" \
-            -authenticationKeyIssuerID "$(printf '%s' "$ASC_ISSUER_ID" | tr -d '[:space:]')" \
             -skipPackagePluginValidation -skipMacroValidation \
-            DEVELOPMENT_TEAM="$(printf '%s' "$APPLE_TEAM_ID" | tr -d '[:space:]')" \
-            CODE_SIGN_STYLE=Automatic \
+            DEVELOPMENT_TEAM="$TAKIM" \
             MARKETING_VERSION="$SURUM" \
             CURRENT_PROJECT_VERSION="${{ github.run_number }}" \
             ADMOB_APP_ID="$ADMOB" \
@@ -144,9 +217,10 @@ jobs:
             }
             tail -n 20 "$RUNNER_TEMP/arsiv.log"
 
+      # Dışa aktarma da elle imzalıdır: aynı sertifika ve profil kullanılır, Apple'da yeni sertifika açılmaz.
+      # API anahtarı yalnızca TestFlight'a yükleme için kullanılır.
       - name: Mağaza imzasıyla imzala ve TestFlight'a yükle
         env:
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
         run: |
@@ -158,8 +232,13 @@ jobs:
           <dict>
             <key>method</key><string>app-store-connect</string>
             <key>destination</key><string>upload</string>
-            <key>teamID</key><string>$(printf '%s' "$APPLE_TEAM_ID" | tr -d '[:space:]')</string>
-            <key>signingStyle</key><string>automatic</string>
+            <key>teamID</key><string>$TAKIM</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>signingCertificate</key><string>$IMZA_KIMLIK</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>com.enesgunsayar.gece101</key><string>$PROFIL_AD</string>
+            </dict>
             <key>uploadSymbols</key><true/>
             <key>manageAppVersionAndBuildNumber</key><false/>
           </dict>
@@ -169,13 +248,15 @@ jobs:
             -archivePath "$RUNNER_TEMP/App.xcarchive" \
             -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
             -exportPath "$RUNNER_TEMP/cikti" \
-            -allowProvisioningUpdates \
             -authenticationKeyPath "$ANAHTAR" \
             -authenticationKeyID "$(printf '%s' "$ASC_KEY_ID" | tr -d '[:space:]')" \
             -authenticationKeyIssuerID "$(printf '%s' "$ASC_ISSUER_ID" | tr -d '[:space:]')"
           echo "### TestFlight'a yüklendi" >> "$GITHUB_STEP_SUMMARY"
           echo "Derleme ${{ github.run_number }}. Apple işlemeyi 10–30 dakikada bitirir, sonra TestFlight uygulamasında görünür." >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Anahtarı sil
+      - name: Anahtarı ve imza zincirini sil
         if: always()
-        run: rm -f "$RUNNER_TEMP"/AuthKey_*.p8
+        run: |
+          rm -f "$RUNNER_TEMP"/AuthKey_*.p8 "$RUNNER_TEMP"/dagitim.p12 "$RUNNER_TEMP"/profil.*
+          if [ -f "$RUNNER_TEMP/imza.keychain-db" ]; then security delete-keychain "$RUNNER_TEMP/imza.keychain-db" || true; fi
+          rm -f "$HOME/Library/MobileDevice/Provisioning Profiles"/*.mobileprovision "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"/*.mobileprovision
